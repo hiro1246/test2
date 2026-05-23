@@ -476,6 +476,7 @@
                 <a class="header-btn primary" href="{{ route('products.create') }}">出品</a>
             </div>
         </header>
+        <a class="back-link" href="{{ route('products.show', $product) }}">&#8592; 商品ページに戻る</a>
         <div class="layout">
             <article class="card" aria-label="購入手続き">
                 <div class="top-row">
@@ -528,7 +529,11 @@
                         <button type="button" class="delivery-cancel-btn" id="deliveryCancelBtn">キャンセル</button>
                     </div>
                 </form>
-                @if (session('status'))
+                @if ($errors->has('purchase'))
+                <p class="notice" style="color:#b91c1c;background:#fff0f0;border:1px solid #fca5a5;">
+                    {{ $errors->first('purchase') }}
+                </p>
+                @elseif (session('status'))
                 <p class="notice">{{ session('status') }}</p>
                 @endif
             </article>
@@ -542,11 +547,17 @@
                         </tr>
                     </tbody>
                 </table>
+                @if ($product->is_sold)
+                <p class="notice" style="color:#b91c1c;background:#fff0f0;border:1px solid #fca5a5;">
+                    この商品はすでに購入済みです。他のユーザーが購入手続き中の可能性があります。
+                </p>
+                @else
                 <form method="POST" action="{{ route('products.purchase.complete', $product) }}">
                     @csrf
                     <input type="hidden" name="payment_method" id="paymentMethodInput" value="card">
                     <button type="submit" class="summary-buy-btn" id="summaryBuyBtn">購入する</button>
                 </form>
+                @endif
             </aside>
         </div>
     </div>

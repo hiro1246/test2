@@ -332,7 +332,7 @@
 <body>
     <div class="page">
         <header class="header">
-            <a class="header-brand" href="{{ route('products.index') }}">COACHTECH</a>
+            <a class="header-brand" href="{{ route('setup') }}">COACHTECH</a>
             <form class="header-search-form" action="{{ route('products.index') }}" method="GET">
                 @if ($currentFilter === 'mylist')
                 <input type="hidden" name="list" value="mylist">

@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Product;
+use Illuminate\Validation\Rule;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
@@ -39,6 +40,13 @@ class ProfileController extends Controller
     {
         $validated = $request->validate([
             'name' => ['required', 'string', 'max:255', 'regex:/\S/u'],
+            'email' => [
+                'required',
+                'string',
+                'max:255',
+                'email',
+                Rule::unique('users', 'email')->ignore($request->user()?->id),
+            ],
             'profile_image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp', 'max:2048'],
             'postal_code' => ['required', 'regex:/^\d{3}-?\d{4}$/'],
             'address' => ['required', 'string', 'max:255', 'regex:/\S/u'],
@@ -47,6 +55,9 @@ class ProfileController extends Controller
             'name.required' => 'ユーザー名を入力してください',
             'name.max' => 'ユーザー名は255文字以内で入力してください',
             'name.regex' => 'ユーザー名を入力してください',
+            'email.required' => 'メールアドレスを入力してください',
+            'email.email' => 'メールアドレスはメール形式で入力してください',
+            'email.unique' => 'このメールアドレスは既に使用されています',
             'profile_image.image' => 'プロフィール画像は画像ファイルを選択してください',
             'profile_image.mimes' => 'プロフィール画像はjpg、jpeg、png、webp形式でアップロードしてください',
             'profile_image.max' => 'プロフィール画像は2MB以下でアップロードしてください',
@@ -72,6 +83,7 @@ class ProfileController extends Controller
 
         $user->update([
             'name' => trim($validated['name']),
+            'email' => mb_strtolower(trim($validated['email'])),
             'profile_image_path' => $profileImagePath,
             'postal_code' => $this->formatPostalCode($validated['postal_code']),
             'address' => trim($validated['address']),

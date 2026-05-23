@@ -70,6 +70,33 @@ php artisan db:seed
     - パスワード: `laravel_pass`
 - **MailHog**: http://localhost:8025
 
+## 画面URL一覧
+
+ベースURLは `http://localhost` です。
+
+### 認証不要でアクセス可能
+
+- トップページ: `/`
+- ログイン画面: `/login`
+- 会員登録画面: `/register`
+- 商品一覧画面: `/products`
+- 商品詳細画面: `/products/{product}`（例: `/products/1`）
+- セットアップ導線: `/setup`
+
+### ログイン後にアクセス可能
+
+- 商品出品画面: `/products/create`
+- 購入画面: `/products/{product}/purchase`（例: `/products/1/purchase`）
+- 送付先変更画面: `/products/{product}/purchase/destination`
+- コンビニ支払い案内画面: `/products/{product}/purchase/konbini-pending?session_id={CHECKOUT_SESSION_ID}`
+- プロフィール設定画面: `/profile/setup`
+- プロフィール画面: `/profile`
+
+### メール認証関連
+
+- 認証メール案内画面: `/email/verify`
+- 認証リンク受け口: `/email/verify/{id}/{hash}`
+
 ## meilhog（MailHog）について
 
 この開発環境では、メール送信の確認に MailHog を使用しています。
@@ -125,14 +152,113 @@ STRIPE_WEBHOOK_SECRET=
 - Stripe の Webhook は `/stripe/webhook` で受けています。
 - 決済完了後は、支払い方法に応じて購入結果の画面へ遷移します。
 
+### 購入するボタン押下後のデバッグ処理
+
+購入画面で「購入する」をクリックした後に不具合調査する場合は、以下の順で確認してください。
+
+1. ブラウザの遷移先を確認する
+
+- 正常時は Stripe Checkout へリダイレクトされます。
+- 同一商品を他ユーザーが先に購入手続き中の場合は、購入画面へ戻されてエラーメッセージが表示されます。
+
+2. Laravelログを確認する
+
+```sh
+docker-compose exec php tail -f storage/logs/laravel.log
+```
+
+- Stripe接続失敗時は `Stripe checkout session create failed.` が出力されます。
+- 想定外エラー時は `Checkout session create unexpected failure.` が出力されます。
+
+3. 商品の売約状態をDBで確認する
+
+```sql
+SELECT id, is_sold, buyer_user_id, seller_user_id
+FROM products
+WHERE id = 対象商品ID;
+```
+
+- `is_sold = 1` かつ `buyer_user_id` が入っている場合は、購入手続き中または購入済みです。
+- 決済失敗時に売約が解除されない場合は、ログの例外発生タイミングを確認してください。
+
+4. Stripeダッシュボードで Checkout Session を確認する
+
+- Metadata の `product_id` と `buyer_user_id` が、対象商品・ログインユーザーと一致しているか確認します。
+- コンビニ支払いの場合は支払いステータスが反映されるまで時間差があるため、Webhook受信有無も合わせて確認します。
+
+5. Webhook受信テスト（必要時）
+
+```sh
+stripe listen --forward-to http://localhost/stripe/webhook
+```
+
+- テストイベント送信後、`/stripe/webhook` が 200 を返すことを確認してください。
+
+## データベース設計
+
+### ER図（Mermaid）
+
+以下は Mermaid によるER図です。GitHub上、またはVS CodeのMarkdownプレビューで図として表示されます。
+
+- VS Code: `Markdown: Open Preview` を実行
+
+```mermaid
+erDiagram
+    USERS ||--o{ PRODUCTS : sells
+    USERS ||--o{ PRODUCTS : buys
+    USERS ||--o{ COMMENTS : writes
+    USERS ||--o{ FAVORITES : has
+    PRODUCTS ||--o{ COMMENTS : receives
+    PRODUCTS ||--o{ FAVORITES : "favorited by"
+
+    USERS {
+        bigint id PK
+        string name
+        string postal_code
+        string address
+        string building_name
+        string email UK
+        timestamp email_verified_at
+        string password
+        string remember_token
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    PRODUCTS {
+        bigint id PK
+        string name
+        string image_path
+        bigint seller_user_id FK
+        bigint buyer_user_id FK
+        boolean is_sold
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    COMMENTS {
+        bigint id PK
+        bigint product_id FK
+        bigint user_id FK
+        string comment
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    FAVORITES {
+        bigint id PK
+        bigint user_id FK
+        bigint product_id FK
+        timestamp created_at
+        timestamp updated_at
+    }
+```
 ### テーブル説明
 
 - **users**: ユーザー情報（出品者・購入者）
 - **products**: 商品情報（seller_user_id：出品者、buyer_user_id：購入者）
 - **comments**: 商品に対するコメント
 - **favorites**: ユーザーのお気に入り商品管理（user_id, product_idの組み合わせはユニーク）
-
-
 ## 商品削除方法
 
 特定の商品を削除したい場合は、以下のエンドポイントにPOSTリクエストを送信してください（要ログイン）。
@@ -141,19 +267,22 @@ STRIPE_WEBHOOK_SECRET=
 - メソッド: POST
 
 例：curlコマンド
+
 ```sh
 curl -X POST http://localhost/products/31/delete --cookie "your_session_cookie"
 ```
 
 BladeやJSからフォームで：
+
 ```html
 <form method="POST" action="/products/31/delete">
-	@csrf
-	<button type="submit">削除</button>
+    @csrf
+    <button type="submit">削除</button>
 </form>
 ```
 
 これで商品ID 31が削除されます。
+
 <p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400"></a></p>
 
 <p align="center">

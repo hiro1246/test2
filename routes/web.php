@@ -29,7 +29,11 @@ Route::get('/products', [ProductController::class, 'index'])
     ->name('products.index');
 
 Route::get('/products/{product}', [ProductController::class, 'show'])
+    ->whereNumber('product')
     ->name('products.show');
+
+Route::post('/stripe/webhook', [ProductController::class, 'stripeWebhook'])
+    ->name('stripe.webhook');
 
 Route::middleware('auth')->group(function () {
     Route::get('/products/create', [ProductController::class, 'create'])
@@ -42,30 +46,43 @@ Route::middleware('auth')->group(function () {
         ->name('products.store');
 
     Route::get('/products/{product}/purchase', [ProductController::class, 'purchase'])
+        ->whereNumber('product')
         ->name('products.purchase');
 
     Route::post('/products/{product}/purchase/complete', [ProductController::class, 'completePurchase'])
+        ->whereNumber('product')
         ->name('products.purchase.complete');
 
     Route::get('/products/{product}/purchase/success', [ProductController::class, 'purchaseSuccess'])
+        ->whereNumber('product')
         ->name('products.purchase.success');
 
+    Route::get('/products/{product}/purchase/konbini-pending', [ProductController::class, 'konbiniPending'])
+        ->whereNumber('product')
+        ->name('products.purchase.konbini-pending');
+
     Route::get('/products/{product}/purchase/cancel', [ProductController::class, 'purchaseCancel'])
+        ->whereNumber('product')
         ->name('products.purchase.cancel');
 
     Route::post('/products/{product}/purchase/image', [ProductController::class, 'updatePurchaseImage'])
+        ->whereNumber('product')
         ->name('products.purchase.image.update');
 
     Route::get('/products/{product}/purchase/destination', [ProductController::class, 'purchaseDestination'])
+        ->whereNumber('product')
         ->name('products.purchase.destination');
 
     Route::post('/products/{product}/purchase/destination', [ProductController::class, 'updatePurchaseDestination'])
+        ->whereNumber('product')
         ->name('products.purchase.destination.update');
 
     Route::post('/products/{product}/comments', [ProductController::class, 'storeComment'])
+        ->whereNumber('product')
         ->name('products.comments.store');
 
     Route::post('/products/{product}/favorite', [ProductController::class, 'toggleFavorite'])
+        ->whereNumber('product')
         ->name('products.favorites.toggle');
 
     Route::get('/profile/setup', [ProfileController::class, 'edit'])

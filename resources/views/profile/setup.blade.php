@@ -423,6 +423,23 @@
                 </div>
 
                 <div class="field">
+                    <label class="label" for="email">メールアドレス</label>
+                    <input
+                        class="input"
+                        id="email"
+                        name="email"
+                        type="email"
+                        value="{{ old('email', $user->email) }}"
+                        maxlength="255"
+                        placeholder="user@example.com"
+                        required>
+                    <p class="hint">コンビニ支払いの案内送信に利用します。</p>
+                    @error('email')
+                    <p class="error">{{ $message }}</p>
+                    @enderror
+                </div>
+
+                <div class="field">
                     <label class="label" for="postal_code">郵便番号</label>
                     <input
                         class="input"

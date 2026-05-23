@@ -2,10 +2,13 @@
 
 namespace App\Http\Controllers;
 
+use Illuminate\Support\Facades\DB;
+
 use App\Models\Product;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
@@ -13,6 +16,7 @@ use Illuminate\Support\Str;
 use Illuminate\View\View;
 use Stripe\Exception\ApiErrorException;
 use Stripe\StripeClient;
+use Stripe\Webhook;
 
 class ProductController extends Controller
 {
@@ -208,8 +212,13 @@ class ProductController extends Controller
         ]);
     }
 
-    public function purchase(Product $product): View
+    public function purchase(Request $request, Product $product): View|RedirectResponse
     {
+        $guard = $this->guardPurchaseAccess($request, $product);
+        if ($guard) {
+            return $guard;
+        }
+
         $destination = $this->resolveDestinationData(request(), $product);
 
         return view('products.purchase', [
@@ -219,8 +228,13 @@ class ProductController extends Controller
         ]);
     }
 
-    public function purchaseDestination(Product $product): View
+    public function purchaseDestination(Request $request, Product $product): View|RedirectResponse
     {
+        $guard = $this->guardPurchaseAccess($request, $product);
+        if ($guard) {
+            return $guard;
+        }
+
         $destination = $this->resolveDestinationData(request(), $product);
 
         return view('products.purchase-destination', [
@@ -231,6 +245,11 @@ class ProductController extends Controller
 
     public function updatePurchaseImage(Request $request, Product $product): RedirectResponse
     {
+        $guard = $this->guardPurchaseAccess($request, $product);
+        if ($guard) {
+            return $guard;
+        }
+
         $validated = $request->validate([
             'product_image' => ['required', 'image', 'max:5120'],
         ], [
@@ -254,6 +273,11 @@ class ProductController extends Controller
 
     public function updatePurchaseDestination(Request $request, Product $product): RedirectResponse
     {
+        $guard = $this->guardPurchaseAccess($request, $product);
+        if ($guard) {
+            return $guard;
+        }
+
         $validated = $request->validate([
             'postal_code' => ['required', 'regex:/^\d{3}-?\d{4}$/'],
             'address' => ['required', 'string', 'max:255', 'regex:/\S/u'],
@@ -287,12 +311,6 @@ class ProductController extends Controller
                 ->route('login.show');
         }
 
-        if ($product->is_sold) {
-            return redirect()
-                ->route('products.show', $product)
-                ->with('status', 'この商品はすでに購入済みです。');
-        }
-
         if (
             Schema::hasColumn('products', 'seller_user_id')
             && $product->seller_user_id !== null
@@ -308,9 +326,14 @@ class ProductController extends Controller
             $paymentMethod = 'convenience';
         }
 
-        if ($paymentMethod !== 'card') {
-            return $this->finalizePurchase($request, $product, $user->id, '商品を購入しました。');
+        if ($paymentMethod === 'convenience' && ((int) $product->price < 120 || (int) $product->price > 300000)) {
+            return redirect()
+                ->route('products.purchase', $product)
+                ->with('status', 'コンビニ支払いは120円〜300,000円の範囲で利用できます。');
         }
+
+        $userEmail = trim((string) ($user->email ?? ''));
+        $hasValidEmail = $this->isStripeCompatibleEmail($userEmail);
 
         $stripeSecret = (string) config('services.stripe.secret');
 
@@ -320,17 +343,61 @@ class ProductController extends Controller
                 ->with('status', 'Stripe決済を利用するため、STRIPE_SECRET を .env に設定してください。');
         }
 
+        $hasBuyerUserIdColumn = Schema::hasColumn('products', 'buyer_user_id');
+        $reservedInThisRequest = false;
+        $productId = $product->id;
+
+        try {
+            $product = DB::transaction(function () use ($productId, $user, $hasBuyerUserIdColumn, &$reservedInThisRequest) {
+                $product = \App\Models\Product::query()->whereKey($productId)->lockForUpdate()->first();
+
+                $isReservedByCurrentUser = $product->is_sold
+                    && $hasBuyerUserIdColumn
+                    && (int) $product->buyer_user_id === (int) $user->id;
+
+                if ($product->is_sold && ! $isReservedByCurrentUser) {
+                    throw new \RuntimeException('already_sold');
+                }
+
+                if (! $product->is_sold) {
+                    $updateAttributes = ['is_sold' => true];
+                    if ($hasBuyerUserIdColumn) {
+                        $updateAttributes['buyer_user_id'] = $user->id;
+                    }
+                    $product->update($updateAttributes);
+                    $product->forceFill($updateAttributes);
+                    $reservedInThisRequest = true;
+                }
+
+                return $product;
+            });
+        } catch (\RuntimeException $e) {
+            if ($e->getMessage() === 'already_sold') {
+                return redirect()->route('products.purchase', $product)->withErrors(['purchase' => 'この商品はすでに購入済みです。他のユーザーが購入手続き中の可能性があります。']);
+            }
+
+            throw $e;
+        }
+
         try {
             $stripe = new StripeClient($stripeSecret);
 
-            $checkoutSession = $stripe->checkout->sessions->create([
+            $paymentMethodTypes = $paymentMethod === 'card'
+                ? ['card']
+                : ['konbini'];
+
+            $checkoutSessionParams = [
                 'mode' => 'payment',
-                'success_url' => route('products.purchase.success', $product) . '?session_id={CHECKOUT_SESSION_ID}',
+                'payment_method_types' => $paymentMethodTypes,
+                'success_url' => $paymentMethod === 'convenience'
+                    ? route('products.purchase.konbini-pending', $product) . '?session_id={CHECKOUT_SESSION_ID}'
+                    : route('products.purchase.success', $product) . '?session_id={CHECKOUT_SESSION_ID}',
                 'cancel_url' => route('products.purchase.cancel', $product),
                 'client_reference_id' => (string) $user->id,
                 'metadata' => [
                     'product_id' => (string) $product->id,
                     'buyer_user_id' => (string) $user->id,
+                    'payment_method' => $paymentMethod,
                 ],
                 'line_items' => [[
                     'quantity' => 1,
@@ -343,14 +410,62 @@ class ProductController extends Controller
                         ],
                     ],
                 ]],
-            ]);
+            ];
+
+            if ($hasValidEmail) {
+                $checkoutSessionParams['customer_email'] = $userEmail;
+            }
+
+            if ($paymentMethod === 'convenience') {
+                $checkoutSessionParams['payment_method_options'] = [
+                    'konbini' => [
+                        'expires_after_days' => 3,
+                    ],
+                ];
+            }
+
+            $checkoutSession = $stripe->checkout->sessions->create($checkoutSessionParams);
         } catch (ApiErrorException $e) {
+            Log::error('Stripe checkout session create failed.', [
+                'product_id' => $product->id,
+                'user_id' => $user->id,
+                'payment_method' => $paymentMethod,
+                'price' => (int) $product->price,
+                'stripe_error' => $e->getMessage(),
+                'user_email' => $userEmail,
+            ]);
+
+            if ($reservedInThisRequest) {
+                $this->rollbackReservation($product, $hasBuyerUserIdColumn);
+            }
+
+            return redirect()
+                ->route('products.purchase', $product)
+                ->with('status', '決済画面への接続に失敗しました。商品価格とStripe設定をご確認ください。');
+        } catch (\Throwable $e) {
+            Log::error('Checkout session create unexpected failure.', [
+                'product_id' => $product->id,
+                'user_id' => $user->id,
+                'payment_method' => $paymentMethod,
+                'price' => (int) $product->price,
+                'error_class' => get_class($e),
+                'error_message' => $e->getMessage(),
+            ]);
+
+            if ($reservedInThisRequest) {
+                $this->rollbackReservation($product, $hasBuyerUserIdColumn);
+            }
+
             return redirect()
                 ->route('products.purchase', $product)
                 ->with('status', '決済画面への接続に失敗しました。時間をおいて再度お試しください。');
         }
 
         if (! isset($checkoutSession->url) || $checkoutSession->url === '') {
+            if ($reservedInThisRequest) {
+                $this->rollbackReservation($product, $hasBuyerUserIdColumn);
+            }
+
             return redirect()
                 ->route('products.purchase', $product)
                 ->with('status', '決済画面URLの取得に失敗しました。');
@@ -367,7 +482,10 @@ class ProductController extends Controller
             return redirect()->route('login.show');
         }
 
-        if ($product->is_sold) {
+        if (
+            $product->is_sold
+            && (! Schema::hasColumn('products', 'buyer_user_id') || (int) $product->buyer_user_id !== $user->id)
+        ) {
             return redirect()
                 ->route('profile.show')
                 ->with('status', 'この商品はすでに購入済みです。');
@@ -412,23 +530,105 @@ class ProductController extends Controller
         $referenceUserId = (string) ($checkoutSession->client_reference_id ?? '');
 
         if (
-            ($checkoutSession->payment_status ?? '') !== 'paid'
-            || $metadataProductId !== (string) $product->id
+            $metadataProductId !== (string) $product->id
             || $referenceUserId !== (string) $user->id
         ) {
             return redirect()
                 ->route('products.purchase', $product)
-                ->with('status', '決済が完了していないため購入を確定できません。');
+                ->with('status', '決済セッション情報が一致しません。');
         }
 
-        return $this->finalizePurchase($request, $product, $user->id, 'Stripe決済が完了し、商品を購入しました。');
+        if (($checkoutSession->payment_status ?? '') !== 'paid') {
+            return redirect()
+                ->route('products.purchase', $product)
+                ->with('status', '入金確認後に購入が確定します。コンビニ支払いの場合はお支払い完了後に再度アクセスしてください。');
+        }
+
+        $paymentMethod = (string) ($checkoutSession->metadata->payment_method ?? '');
+        $redirectRoute = $paymentMethod === 'convenience'
+            ? 'products.index'
+            : 'profile.show';
+
+        return redirect()
+            ->route($redirectRoute)
+            ->with('status', '決済を受け付けました。購入反映まで数秒かかる場合があります。');
     }
 
-    public function purchaseCancel(Product $product): RedirectResponse
+    public function konbiniPending(Request $request, Product $product): \Illuminate\View\View|RedirectResponse
     {
+        $user = $request->user();
+        if (! $user) {
+            return redirect()->route('login.show');
+        }
+
+        $sessionId = (string) $request->query('session_id', '');
+        if ($sessionId === '') {
+            return redirect()->route('products.show', $product);
+        }
+
+        $stripeSecret = (string) config('services.stripe.secret');
+        $hostedVoucherUrl = null;
+
+        try {
+            $stripe = new StripeClient($stripeSecret);
+            $session = $stripe->checkout->sessions->retrieve($sessionId, ['expand' => ['payment_intent']]);
+            $hostedVoucherUrl = $session->payment_intent->next_action->konbini_display_details->hosted_voucher_url ?? null;
+        } catch (\Throwable $e) {
+            Log::error('konbiniPending: failed to retrieve session.', ['error' => $e->getMessage()]);
+        }
+
+        return view('products.konbini-pending', [
+            'product' => $product,
+            'hostedVoucherUrl' => $hostedVoucherUrl,
+        ]);
+    }
+
+    public function purchaseCancel(Request $request, Product $product): RedirectResponse
+    {
+        // 仮売約解除（自分が仮売約者の場合のみ）
+        $user = $request->user();
+        if ($user && Schema::hasColumn('products', 'buyer_user_id') && (int) $product->buyer_user_id === $user->id) {
+            $product->update(['is_sold' => false, 'buyer_user_id' => null]);
+        }
+
+        $request->session()->forget($this->destinationSessionKey($product));
+
         return redirect()
-            ->route('products.purchase', $product)
+            ->route('products.show', $product)
             ->with('status', '決済をキャンセルしました。');
+    }
+
+    public function stripeWebhook(Request $request): JsonResponse
+    {
+        $payload = $request->getContent();
+        $signatureHeader = (string) $request->header('Stripe-Signature', '');
+        $webhookSecret = (string) config('services.stripe.webhook_secret');
+
+        if ($webhookSecret === '') {
+            return response()->json([
+                'message' => 'Webhook secret is not configured.',
+            ], 500);
+        }
+
+        try {
+            $event = Webhook::constructEvent($payload, $signatureHeader, $webhookSecret);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'message' => 'Invalid webhook payload.',
+            ], 400);
+        }
+
+        if (in_array((string) $event->type, ['checkout.session.completed', 'checkout.session.async_payment_succeeded'], true)) {
+            $checkoutSession = $event->data->object ?? null;
+
+            if (is_object($checkoutSession) && (($checkoutSession->payment_status ?? '') === 'paid')) {
+                $this->finalizePurchaseFromCheckoutSession($checkoutSession);
+            }
+        }
+
+        return response()->json([
+            'received' => true,
+        ]);
     }
 
     public function storeComment(Request $request, Product $product): RedirectResponse
@@ -495,7 +695,112 @@ class ProductController extends Controller
         return substr($digits, 0, 3) . '-' . substr($digits, 3, 4);
     }
 
+    private function isStripeCompatibleEmail(string $email): bool
+    {
+        if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+            return false;
+        }
+
+        // Stripe validates email format more strictly than PHP's default filter.
+        return preg_match('/^[^\s@]+@[^\s@]+\.[^\s@]+$/', $email) === 1;
+    }
+
+    private function guardPurchaseAccess(Request $request, Product $product): ?RedirectResponse
+    {
+        $user = $request->user();
+
+        if (! $user) {
+            return redirect()->route('login.show');
+        }
+
+        $latestProduct = Product::query()->find($product->id);
+        if (! $latestProduct) {
+            return redirect()->route('products.index');
+        }
+
+        if (
+            Schema::hasColumn('products', 'seller_user_id')
+            && $latestProduct->seller_user_id !== null
+            && (int) $latestProduct->seller_user_id === (int) $user->id
+        ) {
+            return redirect()
+                ->route('products.show', $latestProduct)
+                ->with('status', '自分が出品した商品は購入できません。');
+        }
+
+        if ($latestProduct->is_sold) {
+            if (
+                Schema::hasColumn('products', 'buyer_user_id')
+                && (int) $latestProduct->buyer_user_id === (int) $user->id
+            ) {
+                return null;
+            }
+
+            return redirect()
+                ->route('products.show', $latestProduct)
+                ->with('status', 'この商品はすでに購入済みです。');
+        }
+
+        return null;
+    }
+
+    private function rollbackReservation(Product $product, bool $hasBuyerUserIdColumn): void
+    {
+        $rollbackAttributes = ['is_sold' => false];
+
+        if ($hasBuyerUserIdColumn) {
+            $rollbackAttributes['buyer_user_id'] = null;
+        }
+
+        Product::query()
+            ->whereKey($product->id)
+            ->update($rollbackAttributes);
+
+        $product->forceFill($rollbackAttributes);
+    }
+
     private function finalizePurchase(Request $request, Product $product, int $buyerUserId, string $statusMessage): RedirectResponse
+    {
+        if (! $this->markProductAsSold($product, $buyerUserId)) {
+            return redirect()
+                ->route('products.show', $product)
+                ->with('status', 'この商品はすでに購入済みです。');
+        }
+
+        $request->session()->forget($this->destinationSessionKey($product));
+
+        return redirect()
+            ->route('profile.show')
+            ->with('status', $statusMessage);
+    }
+
+    private function finalizePurchaseFromCheckoutSession(object $checkoutSession): void
+    {
+        $productId = (int) ($checkoutSession->metadata->product_id ?? 0);
+        $buyerUserId = (int) ($checkoutSession->metadata->buyer_user_id ?? $checkoutSession->client_reference_id ?? 0);
+
+        if ($productId <= 0 || $buyerUserId <= 0) {
+            return;
+        }
+
+        $product = Product::query()->find($productId);
+
+        if (! $product) {
+            return;
+        }
+
+        if (
+            Schema::hasColumn('products', 'seller_user_id')
+            && $product->seller_user_id !== null
+            && (int) $product->seller_user_id === $buyerUserId
+        ) {
+            return;
+        }
+
+        $this->markProductAsSold($product, $buyerUserId);
+    }
+
+    private function markProductAsSold(Product $product, int $buyerUserId): bool
     {
         $updateAttributes = [
             'is_sold' => true,
@@ -505,11 +810,15 @@ class ProductController extends Controller
             $updateAttributes['buyer_user_id'] = $buyerUserId;
         }
 
-        $product->update($updateAttributes);
-        $request->session()->forget($this->destinationSessionKey($product));
+        $updated = Product::query()
+            ->whereKey($product->id)
+            ->where('is_sold', false)
+            ->update($updateAttributes);
 
-        return redirect()
-            ->route('profile.show')
-            ->with('status', $statusMessage);
+        if ($updated > 0) {
+            $product->forceFill($updateAttributes);
+        }
+
+        return $updated > 0;
     }
 }
